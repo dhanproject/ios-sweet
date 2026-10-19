@@ -28,7 +28,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,227 @@
 +/*
 + * SWEET Adreno 618 bring-up, stage 1: CX power domain probe.
 + * Off by default; boot-arg sweetgpu=1 enables it (sweetgpudelay=N seconds,
@@ -89,6 +89,8 @@
 +
 +static int gpu_sleep_chan;
 +static bool gpu_started;
++static unsigned gpu_stop = 99;  /* boot-arg sweetgpustop=N: stop before step N */
++static unsigned gpu_trace_ms = 2000;  /* pause after each logged access */
 +
 +static uint32_t
 +gpu_rd(vm_offset_t base, uint32_t off)
@@ -115,6 +117,10 @@
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
++/* Log, then pause so the console log (ufslogsecs=1) is on disk before the next access. */
++#define GPU_LOG(...) do { printf(__VA_ARGS__); gpu_wait(gpu_trace_ms); } while (0)
++#define GPU_STEP(n) do { if ((n) >= gpu_stop) { GPU_LOG("SWEET GPU: stop before step %u (sweetgpustop)\n", (unsigned)(n)); goto out; } } while (0)
++
 +/* Poll until (reg & mask) == want, up to ~5 ms. */
 +static bool
 +gpu_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want)
@@ -133,10 +139,12 @@
 +gpu_branch_on(const char *name, vm_offset_t base, uint32_t off)
 +{
 +	uint32_t before = gpu_rd(base, off);
++	GPU_LOG("SWEET GPU: %s cbcr %#x, enabling\n", name, before);
 +	gpu_wr(base, off, before | 1u);
++	GPU_LOG("SWEET GPU: %s written\n", name);
 +	bool ok = gpu_poll(base, off, CBCR_CLK_OFF, 0);
-+	printf("SWEET GPU: %s cbcr %#x -> %#x %s\n", name, before,
-+	    gpu_rd(base, off), ok ? "on" : "STILL OFF");
++	GPU_LOG("SWEET GPU: %s cbcr -> %#x %s\n", name, gpu_rd(base, off),
++	    ok ? "on" : "STILL OFF");
 +	return ok;
 +}
 +
@@ -150,7 +158,9 @@
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("sweetgpudelay", &delay_s, sizeof(delay_s));
-+	printf("SWEET GPU: stage1 CX probe in %u s\n", delay_s);
++	(void)PE_parse_boot_argn("sweetgpustop", &gpu_stop, sizeof(gpu_stop));
++	(void)PE_parse_boot_argn("sweetgputrace", &gpu_trace_ms, sizeof(gpu_trace_ms));
++	printf("SWEET GPU: stage1b CX probe in %u s (stop=%u trace=%u ms)\n", delay_s, gpu_stop, gpu_trace_ms);
 +	gpu_wait(delay_s * 1000u);
 +
 +	gcc = ml_io_map(GPU_GCC_PA, 0x1000);
@@ -161,61 +171,64 @@
 +		goto out;
 +	}
 +
-+	/* 1. GCC side: GPU config AHB + SNOC DVM (Linux keeps CFG_AHB always on). */
-+	printf("SWEET GPU: [1] gcc cfg_ahb=%#x memnoc=%#x snoc_dvm=%#x\n",
++	/* 1. GCC side. First run: log ended right after cfg_ahb (snoc_dvm write or GPU_CC read):
++	 * gcc_gpu_snoc_dvm_gfx is no longer touched. cfg_ahb is already on (ABL). */
++	GPU_STEP(1);
++	GPU_LOG("SWEET GPU: [1] gcc cfg_ahb=%#x memnoc=%#x snoc_dvm=%#x\n",
 +	    gpu_rd(gcc, GCC_GPU_CFG_AHB), gpu_rd(gcc, GCC_GPU_MEMNOC),
 +	    gpu_rd(gcc, GCC_GPU_SNOC_DVM));
-+	if (!gpu_branch_on("gcc_gpu_cfg_ahb", gcc, GCC_GPU_CFG_AHB)) {
-+		printf("SWEET GPU: no GPU_CC register access without cfg_ahb, stop\n");
++	if (gpu_rd(gcc, GCC_GPU_CFG_AHB) & CBCR_CLK_OFF) {
++		GPU_LOG("SWEET GPU: [1] cfg_ahb off, no GPU_CC access, stop\n");
 +		goto out;
 +	}
-+	(void)gpu_branch_on("gcc_gpu_snoc_dvm", gcc, GCC_GPU_SNOC_DVM);
-+	gpu_wait(3000);
 +
-+	/* 2. GPU_CC state as ABL left it. */
-+	printf("SWEET GPU: [2] gpucc cx_gdscr=%#x cx_hw=%#x gx_gdscr=%#x gmu_rcg=%#x/%#x\n",
-+	    gpu_rd(cc, GPUCC_CX_GDSCR), gpu_rd(cc, GPUCC_CX_HW_CTRL),
-+	    gpu_rd(cc, GPUCC_GX_GDSCR), gpu_rd(cc, GPUCC_GMU_RCG),
-+	    gpu_rd(cc, GPUCC_GMU_RCG + 4u));
-+	gpu_wait(3000);
++	/* 2. GPU_CC state as ABL left it, one register per log line. */
++	GPU_STEP(2);
++	GPU_LOG("SWEET GPU: [2] reading gpucc cx_gdscr\n");
++	GPU_LOG("SWEET GPU: [2] cx_gdscr=%#x\n", gpu_rd(cc, GPUCC_CX_GDSCR));
++	GPU_LOG("SWEET GPU: [2] cx_hw=%#x\n", gpu_rd(cc, GPUCC_CX_HW_CTRL));
++	GPU_LOG("SWEET GPU: [2] gx_gdscr=%#x\n", gpu_rd(cc, GPUCC_GX_GDSCR));
++	GPU_LOG("SWEET GPU: [2] gmu_rcg=%#x/%#x cxo=%#x crc_ahb=%#x cx_gmu=%#x\n",
++	    gpu_rd(cc, GPUCC_GMU_RCG), gpu_rd(cc, GPUCC_GMU_RCG + 4u),
++	    gpu_rd(cc, GPUCC_CXO), gpu_rd(cc, GPUCC_CRC_AHB), gpu_rd(cc, GPUCC_CX_GMU));
 +
 +	/* 3. CX GDSC on: clear SW_COLLAPSE, wait for PWR_ON (GDSCR and HW_CTRL). */
++	GPU_STEP(3);
 +	gdscr = gpu_rd(cc, GPUCC_CX_GDSCR);
++	GPU_LOG("SWEET GPU: [3] cx gdsc %#x, clearing SW_COLLAPSE\n", gdscr);
 +	if (gdscr & GDSC_SW_COLLAPSE) {
 +		gpu_wr(cc, GPUCC_CX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
 +	}
 +	cx_on = gpu_poll(cc, GPUCC_CX_HW_CTRL, GDSC_PWR_ON, GDSC_PWR_ON) ||
 +	    gpu_poll(cc, GPUCC_CX_GDSCR, GDSC_PWR_ON, GDSC_PWR_ON);
-+	printf("SWEET GPU: [3] cx gdsc %#x -> %#x hw=%#x %s\n", gdscr,
++	GPU_LOG("SWEET GPU: [3] cx gdsc %#x -> %#x hw=%#x %s\n", gdscr,
 +	    gpu_rd(cc, GPUCC_CX_GDSCR), gpu_rd(cc, GPUCC_CX_HW_CTRL),
 +	    cx_on ? "POWERED" : "NOT POWERED");
 +	if (!cx_on) {
 +		goto out;
 +	}
-+	gpu_wait(3000);
 +
 +	/* 4. CX branch clocks needed for GMU register access. */
++	GPU_STEP(4);
 +	clk_ok = gpu_branch_on("gpu_cc_cxo", cc, GPUCC_CXO);
 +	clk_ok &= gpu_branch_on("gpu_cc_crc_ahb", cc, GPUCC_CRC_AHB);
-+	(void)gpu_branch_on("gpu_cc_cx_snoc_dvm", cc, GPUCC_CX_SNOC_DVM);
 +	clk_ok &= gpu_branch_on("gpu_cc_cx_gmu", cc, GPUCC_CX_GMU);
 +	if (!clk_ok) {
-+		printf("SWEET GPU: [4] CX clocks not running, GMU not read, stop\n");
++		GPU_LOG("SWEET GPU: [4] CX clocks not running, GMU not read, stop\n");
 +		goto out;
 +	}
-+	gpu_wait(3000);
 +
 +	/* 5. GMU (CX) registers. Always-on counter moving = CX alive and clocked. */
-+	printf("SWEET GPU: [5] reading GMU (CX) registers\n");
-+	gpu_wait(2000);
++	GPU_STEP(5);
++	GPU_LOG("SWEET GPU: [5] reading GMU (CX) registers\n");
 +	c0 = gpu_rd(gmu, GMU_AO_CNT_L);
 +	delay(1000);
 +	c1 = gpu_rd(gmu, GMU_AO_CNT_L);
-+	printf("SWEET GPU: [5] ao_counter %#x:%#x -> %#x (%s) fw_init=%#x sptprac=%#x rpmh_pstate=%#x hfi_ctrl=%#x\n",
++	GPU_LOG("SWEET GPU: [5] ao_counter %#x:%#x -> %#x (%s) fw_init=%#x sptprac=%#x rpmh_pstate=%#x hfi_ctrl=%#x\n",
 +	    gpu_rd(gmu, GMU_AO_CNT_H), c0, c1, c1 != c0 ? "TICKING" : "frozen",
 +	    gpu_rd(gmu, GMU_FW_INIT_RES), gpu_rd(gmu, GMU_SPTPRAC_STAT),
 +	    gpu_rd(gmu, GMU_RPMH_PSTATE), gpu_rd(gmu, GMU_HFI_CTRL_STAT));
-+	printf("SWEET GPU: stage1 done\n");
++	GPU_LOG("SWEET GPU: stage1 done\n");
 +out:
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
